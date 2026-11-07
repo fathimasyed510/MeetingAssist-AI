@@ -1,0 +1,8 @@
+streamlit
+groq
+python-dotenv
+imageio-ffmpeg
+reportlab
+pypdf
+python-docx
+hindsight-client
