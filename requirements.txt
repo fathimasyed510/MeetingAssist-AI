@@ -5,4 +5,5 @@ imageio-ffmpeg
 reportlab
 pypdf
 python-docx
+supabase
 hindsight-client

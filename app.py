@@ -4,13 +4,13 @@ import os
 import io
 import re
 import json
-import sqlite3
 import tempfile
 import subprocess
 from datetime import datetime
 
 from dotenv import load_dotenv
 from groq import Groq
+from supabase import create_client
 import imageio_ffmpeg
 
 # Hindsight is the long-term memory layer for saved meetings.
@@ -44,54 +44,74 @@ load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
 WHISPER_MODEL = "whisper-large-v3"
 AI_MODEL = "openai/gpt-oss-120b"
-DB_NAME = "meetings.db"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 HINDSIGHT_API_KEY = os.getenv("HINDSIGHT_API_KEY")
-HINDSIGHT_API_URL = os.getenv(
-    "HINDSIGHT_API_URL", "https://api.hindsight.vectorize.io"
-)
-HINDSIGHT_BANK_ID = os.getenv("HINDSIGHT_BANK_ID", "meetingassist")
+HINDSIGHT_API_URL = os.getenv("HINDSIGHT_API_URL", "https://api.hindsight.vectorize.io")
 
 if not API_KEY:
-    st.error(
-        "Groq API key not found. Check that your .env file "
-        "contains GROQ_API_KEY=your_key"
-    )
+    st.error("Groq API key not found. Check GROQ_API_KEY in your .env file.")
+    st.stop()
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Supabase connection details are missing. Add SUPABASE_URL and SUPABASE_KEY to your .env file.")
     st.stop()
 
 client = Groq(api_key=API_KEY)
 
+# Keep a separate Supabase client inside each Streamlit browser session.
+# Do not use st.cache_resource here: a globally shared authenticated client
+# could mix user sessions.
+if "supabase_client" not in st.session_state:
+    st.session_state["supabase_client"] = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = st.session_state["supabase_client"]
+
+# Restore the signed-in user's Supabase session on each Streamlit rerun.
+if st.session_state.get("access_token") and st.session_state.get("refresh_token"):
+    try:
+        supabase.auth.set_session(
+            st.session_state["access_token"],
+            st.session_state["refresh_token"]
+        )
+    except Exception:
+        st.session_state.clear()
+
 # --------------------------------------------------
-# HINDSIGHT LONG-TERM MEETING MEMORY
+# USER-SCOPED HINDSIGHT MEMORY
 # --------------------------------------------------
 
 @st.cache_resource
 def get_hindsight_client():
-    """Create one reusable Hindsight client for this Streamlit session."""
     if Hindsight is None or not HINDSIGHT_API_KEY:
         return None
+    return Hindsight(base_url=HINDSIGHT_API_URL, api_key=HINDSIGHT_API_KEY)
 
-    hindsight = Hindsight(
-        base_url=HINDSIGHT_API_URL,
-        api_key=HINDSIGHT_API_KEY
-    )
-    # Creating an existing bank may return an API error; in that case
-    # the existing bank remains usable, so continue with the client.
+
+def hindsight_bank_for_user(user_id):
+    # Derive the bank only from the authenticated Supabase UUID.
+    safe_id = str(user_id).replace("-", "").lower()
+    return f"ma_user_{safe_id}"
+
+
+def ensure_user_bank(user_id):
+    hindsight = get_hindsight_client()
+    if hindsight is None:
+        return None
+    bank_id = hindsight_bank_for_user(user_id)
     try:
-        hindsight.create_bank(
-            bank_id=HINDSIGHT_BANK_ID,
-            name="MeetingAssist AI Meeting Memory"
-        )
+        hindsight.create_bank(bank_id=bank_id, name="MeetingAssist private meeting memory")
     except Exception:
+        # The bank may already exist. Do not fall back to a shared bank.
         pass
-    return hindsight
+    return bank_id
 
 
-def retain_meeting_in_hindsight(title, created_at, source_type, transcript, analysis):
-    """Store a processed meeting in Hindsight for future recall and reflection."""
+def retain_meeting_in_hindsight(user_id, title, created_at, source_type, transcript, analysis):
     hindsight = get_hindsight_client()
     if hindsight is None:
         return False
-
+    bank_id = ensure_user_bank(user_id)
+    if not bank_id:
+        return False
     memory_content = f"""
 MEETING TITLE: {title}
 DATE: {created_at}
@@ -104,78 +124,80 @@ TOPICS: {json.dumps(analysis.get('topics', []), ensure_ascii=False)}
 FOLLOW-UP: {json.dumps(analysis.get('follow_up', []), ensure_ascii=False)}
 TRANSCRIPT: {transcript[:30000]}
 """.strip()
-
     hindsight.retain(
-        bank_id=HINDSIGHT_BANK_ID,
+        bank_id=bank_id,
         content=memory_content,
         context=f"MeetingAssist meeting: {title}",
         metadata={"meeting_title": title, "meeting_date": created_at, "source_type": source_type}
     )
     return True
 
-
 # --------------------------------------------------
-# DATABASE
+# SUPABASE DATABASE (ROW LEVEL SECURITY ENFORCED)
 # --------------------------------------------------
 
-def get_connection():
-    return sqlite3.connect(DB_NAME, check_same_thread=False)
-
-def setup_database():
-    conn = get_connection()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS meetings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            created_at TEXT,
-            source_type TEXT,
-            transcript TEXT,
-            summary TEXT,
-            analysis_json TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+CURRENT_USER_ID = None
 
 def save_meeting(title, source_type, transcript, analysis):
-    conn = get_connection()
-    conn.execute("""
-        INSERT INTO meetings
-        (title, created_at, source_type, transcript, summary, analysis_json)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        title,
-        datetime.now().strftime("%d %b %Y, %I:%M %p"),
-        source_type,
-        transcript,
-        analysis.get("summary", ""),
-        json.dumps(analysis, ensure_ascii=False)
-    ))
-    conn.commit()
-    conn.close()
+    if not CURRENT_USER_ID:
+        raise RuntimeError("Please sign in before saving a meeting.")
+    created_at = datetime.now().astimezone().isoformat()
+    payload = {
+        "user_id": CURRENT_USER_ID,
+        "title": title,
+        "created_at": created_at,
+        "source_type": source_type,
+        "transcript": transcript,
+        "summary": analysis.get("summary", ""),
+        "analysis_json": analysis
+    }
+    supabase.table("meetings").insert(payload).execute()
+    return created_at
+
 
 def get_meetings():
-    conn = get_connection()
-    rows = conn.execute("""
-        SELECT id, title, created_at, source_type,
-               transcript, summary, analysis_json
-        FROM meetings
-        ORDER BY id DESC
-    """).fetchall()
-    conn.close()
+    if not CURRENT_USER_ID:
+        return []
+    response = (supabase.table("meetings")
+        .select("id,title,created_at,source_type,transcript,summary,analysis_json")
+        .eq("user_id", CURRENT_USER_ID)
+        .order("created_at", desc=True)
+        .execute())
+    rows = []
+    for item in (response.data or []):
+        analysis_json = item.get("analysis_json") or {}
+        if isinstance(analysis_json, str):
+            try:
+                analysis_json = json.loads(analysis_json)
+            except Exception:
+                analysis_json = {}
+        rows.append((item.get("id"), item.get("title"), item.get("created_at"),
+                     item.get("source_type"), item.get("transcript"),
+                     item.get("summary"), json.dumps(analysis_json, ensure_ascii=False)))
     return rows
 
-def get_meeting(meeting_id):
-    conn = get_connection()
-    row = conn.execute("""
-        SELECT id, title, created_at, source_type,
-               transcript, summary, analysis_json
-        FROM meetings WHERE id = ?
-    """, (meeting_id,)).fetchone()
-    conn.close()
-    return row
 
-setup_database()
+def get_meeting(meeting_id):
+    if not CURRENT_USER_ID:
+        return None
+    response = (supabase.table("meetings")
+        .select("id,title,created_at,source_type,transcript,summary,analysis_json")
+        .eq("id", meeting_id)
+        .eq("user_id", CURRENT_USER_ID)
+        .limit(1)
+        .execute())
+    if not response.data:
+        return None
+    item = response.data[0]
+    analysis_json = item.get("analysis_json") or {}
+    if isinstance(analysis_json, str):
+        try:
+            analysis_json = json.loads(analysis_json)
+        except Exception:
+            analysis_json = {}
+    return (item.get("id"), item.get("title"), item.get("created_at"),
+            item.get("source_type"), item.get("transcript"), item.get("summary"),
+            json.dumps(analysis_json, ensure_ascii=False))
 
 # --------------------------------------------------
 # DESIGN
@@ -692,6 +714,68 @@ def show_analysis(analysis):
         st.caption("No topics recorded.")
 
 # --------------------------------------------------
+# SIGN UP / LOGIN GATE
+# --------------------------------------------------
+
+if not st.session_state.get("user_id"):
+    st.markdown("""
+    <div class="hero">
+        <h1>🎙️ MeetingAssist AI</h1>
+        <p>Your meetings. Understood, organised and remembered — privately.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    login_tab, signup_tab = st.tabs(["Log in", "Create account"])
+    with login_tab:
+        with st.form("meetingassist_login"):
+            login_email = st.text_input("Email address", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            login_submit = st.form_submit_button("Log in", use_container_width=True)
+        if login_submit:
+            try:
+                result = supabase.auth.sign_in_with_password({"email": login_email.strip(), "password": login_password})
+                if result.user and result.session:
+                    st.session_state["user_id"] = str(result.user.id)
+                    st.session_state["user_email"] = result.user.email or login_email.strip()
+                    st.session_state["access_token"] = result.session.access_token
+                    st.session_state["refresh_token"] = result.session.refresh_token
+                    st.rerun()
+                else:
+                    st.error("Login did not return an active session. Check your email verification and try again.")
+            except Exception as error:
+                st.error(f"Could not log in: {error}")
+    with signup_tab:
+        with st.form("meetingassist_signup"):
+            signup_email = st.text_input("Email address", key="signup_email")
+            signup_password = st.text_input("Create password", type="password", key="signup_password")
+            signup_confirm = st.text_input("Confirm password", type="password", key="signup_confirm")
+            signup_submit = st.form_submit_button("Create account", use_container_width=True)
+        if signup_submit:
+            if not signup_email.strip() or not signup_password:
+                st.warning("Enter an email address and password.")
+            elif signup_password != signup_confirm:
+                st.warning("The passwords do not match.")
+            elif len(signup_password) < 8:
+                st.warning("Use a password with at least 8 characters.")
+            else:
+                try:
+                    result = supabase.auth.sign_up({"email": signup_email.strip(), "password": signup_password})
+                    if result.user and result.session:
+                        st.session_state["user_id"] = str(result.user.id)
+                        st.session_state["user_email"] = result.user.email or signup_email.strip()
+                        st.session_state["access_token"] = result.session.access_token
+                        st.session_state["refresh_token"] = result.session.refresh_token
+                        st.success("Account created!")
+                        st.rerun()
+                    else:
+                        st.success("Account created. Check your email for the verification link, then return here and log in.")
+                except Exception as error:
+                    st.error(f"Could not create account: {error}")
+    st.caption("Your meeting records are protected by Supabase Row Level Security. Each account has its own meeting records and Hindsight memory bank.")
+    st.stop()
+
+CURRENT_USER_ID = st.session_state.get("user_id")
+
+# --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
 
@@ -721,6 +805,16 @@ with st.sidebar:
     st.caption("💬 Interactive Meeting Q&A")
 
     st.divider()
+    st.caption(f"Signed in as: {st.session_state.get('user_email', 'Account')}")
+    if st.button("Log out", use_container_width=True):
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        for key in ["user_id", "user_email", "access_token", "refresh_token",
+                    "latest_transcript", "latest_analysis", "latest_title", "latest_source", "latest_date"]:
+            st.session_state.pop(key, None)
+        st.rerun()
     st.caption("Powered by Groq AI")
 
 # --------------------------------------------------
@@ -881,7 +975,7 @@ if page == "Dashboard":
         </div>
         <div class="ma-feature-card">
             <div class="ma-feature-title">📚 Meeting Memory</div>
-            <p class="ma-feature-description">Keep a searchable history of your processed meetings in your local database.</p>
+            <p class="ma-feature-description">Keep a searchable history of your meetings in your private cloud account.</p>
         </div>
         <div class="ma-feature-card">
             <div class="ma-feature-title">🧠 AI Meeting Intelligence</div>
@@ -963,18 +1057,14 @@ elif page == "Upload Meeting":
                     with st.spinner("AI is analysing your meeting..."):
                         analysis = analyse_meeting(transcript)
 
-                    save_meeting(
-                        meeting_title.strip(),
-                        source_type,
-                        transcript,
-                        analysis
+                    saved_date = save_meeting(
+                        meeting_title.strip(), source_type, transcript, analysis
                     )
 
-                    saved_date = datetime.now().strftime("%d %b %Y, %I:%M %p")
                     try:
                         hindsight_saved = retain_meeting_in_hindsight(
-                            meeting_title.strip(), saved_date, source_type,
-                            transcript, analysis
+                            CURRENT_USER_ID, meeting_title.strip(), saved_date,
+                            source_type, transcript, analysis
                         )
                     except Exception as hindsight_error:
                         hindsight_saved = False
@@ -990,7 +1080,7 @@ elif page == "Upload Meeting":
                     if hindsight_saved:
                         st.success("🧠 Hindsight: meeting memory retained successfully.")
                     else:
-                        st.info("Hindsight is not connected yet. Add its API key to .env to enable long-term memory.")
+                        st.info("Hindsight memory is not connected. Your meeting is still saved privately in Supabase.")
 
                 except Exception as error:
                     st.error(f"Something went wrong: {error}")
@@ -1179,7 +1269,8 @@ elif page == "Ask Your Meetings":
 
                 try:
                     hindsight = get_hindsight_client()
-                    if hindsight is None:
+                    user_bank_id = ensure_user_bank(CURRENT_USER_ID) if hindsight else None
+                    if hindsight is None or not user_bank_id:
                         st.error(
                             "Hindsight is not connected. Add HINDSIGHT_API_KEY to your .env file "
                             "and install hindsight-client to use long-term meeting memory."
@@ -1197,7 +1288,7 @@ elif page == "Ask Your Meetings":
 
                         with st.spinner("Recalling and reasoning over your Hindsight meeting memories..."):
                             recalled = hindsight.recall(
-                                bank_id=HINDSIGHT_BANK_ID,
+                                bank_id=user_bank_id,
                                 query=memory_query,
                                 max_tokens=5000,
                                 budget="mid"
@@ -1208,7 +1299,7 @@ elif page == "Ask Your Meetings":
                             )
 
                             answer = hindsight.reflect(
-                                bank_id=HINDSIGHT_BANK_ID,
+                                bank_id=user_bank_id,
                                 query=(
                                     memory_query
                                     + "\nUse only information stored in the meeting memory bank. "
