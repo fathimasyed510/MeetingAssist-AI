@@ -1,4 +1,4 @@
-# 🤖 MeetingAssist AI
+# 🎙️ MeetingAssist AI
 ### Your Intelligent Assistant for Every Meeting
 
 MeetingAssist AI is an AI-powered meeting assistant that transforms meeting recordings and text into meaningful insights. It helps users understand discussions, summarize important points, identify action items, and retrieve information from past meetings.
